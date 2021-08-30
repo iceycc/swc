@@ -9,7 +9,7 @@
 pub use self::{
     class::{
         Class, ClassMember, ClassMethod, ClassProp, Constructor, Decorator, MethodKind,
-        PrivateMethod, PrivateProp,
+        PrivateMethod, PrivateProp, StaticBlock,
     },
     decl::{ClassDecl, Decl, FnDecl, VarDecl, VarDeclKind, VarDeclarator},
     expr::{
@@ -64,10 +64,8 @@ pub use self::{
         TsTypeQuery, TsTypeQueryExpr, TsTypeRef, TsUnionOrIntersectionType, TsUnionType,
     },
 };
-use serde::Deserialize;
-use serde::Serialize;
-use swc_common::EqIgnoreSpan;
-use swc_common::{ast_node, Span};
+use serde::{Deserialize, Serialize};
+use swc_common::{ast_node, EqIgnoreSpan, Span};
 
 #[macro_use]
 mod macros;

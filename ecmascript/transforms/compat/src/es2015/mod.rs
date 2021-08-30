@@ -20,6 +20,7 @@ mod duplicate_keys;
 pub mod for_of;
 mod function_name;
 mod instanceof;
+pub mod new_target;
 mod parameters;
 mod regenerator;
 mod shorthand_property;
@@ -79,8 +80,7 @@ mod tests {
     use super::*;
     use swc_common::Mark;
     use swc_ecma_transforms_base::resolver::resolver;
-    use swc_ecma_transforms_testing::test;
-    use swc_ecma_transforms_testing::test_exec;
+    use swc_ecma_transforms_testing::{test, test_exec};
 
     test!(
         ::swc_ecma_parser::Syntax::default(),

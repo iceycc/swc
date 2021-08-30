@@ -1,23 +1,20 @@
-use crate::config::{CompiledPaths, GlobalPassOption, JsMinifyOptions, JscTarget, ModuleConfig};
-use crate::SwcComments;
+use crate::{
+    config::{CompiledPaths, GlobalPassOption, JsMinifyOptions, JscTarget, ModuleConfig},
+    SwcComments,
+};
 use compat::es2020::export_namespace_from;
 use either::Either;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::{collections::HashMap, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use swc_atoms::JsWord;
-use swc_common::comments::Comments;
-use swc_common::sync::Lrc;
-use swc_common::FileName;
-use swc_common::{chain, errors::Handler, Mark, SourceMap};
+use swc_common::{
+    chain, comments::Comments, errors::Handler, sync::Lrc, FileName, Mark, SourceMap,
+};
 use swc_ecma_ast::Module;
-use swc_ecma_minifier::option::MinifyOptions;
+use swc_ecma_minifier::{hygiene_optimizer, option::MinifyOptions, unique_scope};
 use swc_ecma_parser::Syntax;
-use swc_ecma_transforms::hygiene::hygiene_with_config;
-use swc_ecma_transforms::modules::util::Scope;
 use swc_ecma_transforms::{
-    compat, fixer, helpers, hygiene, modules, optimization::const_modules, pass::Optional,
-    proposals::import_assertions, typescript,
+    compat, fixer, helpers, hygiene, hygiene::hygiene_with_config, modules, modules::util::Scope,
+    optimization::const_modules, pass::Optional, proposals::import_assertions, typescript,
 };
 use swc_ecma_transforms_base::ext::MapWithMut;
 use swc_ecma_visit::{as_folder, noop_visit_mut_type, VisitMut};
@@ -28,10 +25,12 @@ pub struct PassBuilder<'a, 'b, P: swc_ecma_visit::Fold> {
     handler: &'b Handler,
     env: Option<swc_ecma_preset_env::Config>,
     pass: P,
+    /// [Mark] for top level bindings and unresolved identifier references.
     global_mark: Mark,
     target: JscTarget,
     loose: bool,
     hygiene: Option<hygiene::Config>,
+    optimize_hygiene: bool,
     fixer: bool,
     inject_helpers: bool,
     minify: Option<JsMinifyOptions>,
@@ -48,12 +47,13 @@ impl<'a, 'b, P: swc_ecma_visit::Fold> PassBuilder<'a, 'b, P> {
         PassBuilder {
             cm,
             handler,
+            env: None,
             pass,
-            target: JscTarget::Es5,
             global_mark,
+            target: JscTarget::Es5,
             loose,
             hygiene: Some(Default::default()),
-            env: None,
+            optimize_hygiene: false,
             fixer: true,
             inject_helpers: true,
             minify: None,
@@ -68,12 +68,13 @@ impl<'a, 'b, P: swc_ecma_visit::Fold> PassBuilder<'a, 'b, P> {
         PassBuilder {
             cm: self.cm,
             handler: self.handler,
+            env: self.env,
             pass,
+            global_mark: self.global_mark,
             target: self.target,
             loose: self.loose,
             hygiene: self.hygiene,
-            env: self.env,
-            global_mark: self.global_mark,
+            optimize_hygiene: self.optimize_hygiene,
             fixer: self.fixer,
             inject_helpers: self.inject_helpers,
             minify: self.minify,
@@ -101,6 +102,11 @@ impl<'a, 'b, P: swc_ecma_visit::Fold> PassBuilder<'a, 'b, P> {
     /// If you pass [None] to this method, the `hygiene` pass will be disabled.
     pub fn hygiene(mut self, config: Option<hygiene::Config>) -> Self {
         self.hygiene = config;
+        self
+    }
+
+    pub fn optimize_hygiene(mut self, enable: bool) -> Self {
+        self.optimize_hygiene = enable;
         self
     }
 
@@ -195,7 +201,7 @@ impl<'a, 'b, P: swc_ecma_visit::Fold> PassBuilder<'a, 'b, P> {
                 ),
                 Optional::new(
                     compat::es3(syntax.dynamic_import()),
-                    self.target <= JscTarget::Es3
+                    cfg!(feature = "es3") && self.target <= JscTarget::Es3
                 )
             ))
         };
@@ -228,7 +234,13 @@ impl<'a, 'b, P: swc_ecma_visit::Fold> PassBuilder<'a, 'b, P> {
                 top_level_mark: self.global_mark,
             }),
             Optional::new(
-                hygiene_with_config(self.hygiene.clone().unwrap_or_default()),
+                chain!(
+                    Optional::new(
+                        chain!(unique_scope(), hygiene_optimizer(self.global_mark)),
+                        self.optimize_hygiene
+                    ),
+                    hygiene_with_config(self.hygiene.clone().unwrap_or_default())
+                ),
                 self.hygiene.is_some()
             ),
             Optional::new(fixer(comments.map(|v| v as &dyn Comments)), self.fixer),

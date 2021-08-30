@@ -1,44 +1,41 @@
-use self::drop_console::drop_console;
-use self::hoist_decls::DeclHoisterConfig;
-use self::optimize::optimizer;
-use self::optimize::OptimizerState;
-use crate::analyzer::analyze;
-use crate::analyzer::ProgramData;
-use crate::analyzer::UsageAnalyzer;
-use crate::compress::hoist_decls::decl_hoister;
-use crate::compress::pure::pure_optimizer;
-use crate::debug::dump;
-use crate::debug::invoke;
-use crate::marks::Marks;
-use crate::option::CompressOptions;
-use crate::util::now;
-use crate::util::unit::CompileUnit;
-use crate::util::Optional;
-use crate::MAX_PAR_DEPTH;
+pub(crate) use self::pure::pure_optimizer;
+use self::{
+    drop_console::drop_console,
+    hoist_decls::DeclHoisterConfig,
+    optimize::{optimizer, OptimizerState},
+};
+use crate::{
+    analyzer::{analyze, ProgramData, UsageAnalyzer},
+    compress::hoist_decls::decl_hoister,
+    debug::{dump, invoke},
+    marks::Marks,
+    mode::Mode,
+    option::CompressOptions,
+    util::{now, unit::CompileUnit, Optional},
+    MAX_PAR_DEPTH,
+};
 #[cfg(feature = "pretty_assertions")]
 use pretty_assertions::assert_eq;
 use rayon::prelude::*;
-use std::borrow::Cow;
-use std::fmt;
-use std::fmt::Debug;
-use std::fmt::Display;
-use std::fmt::Formatter;
-use std::thread;
-use std::time::Instant;
-use swc_common::chain;
-use swc_common::pass::CompilerPass;
-use swc_common::pass::Repeated;
-use swc_common::Globals;
+use std::{
+    borrow::Cow,
+    fmt,
+    fmt::{Debug, Display, Formatter},
+    thread,
+    time::Instant,
+};
+use swc_common::{
+    chain,
+    pass::{CompilerPass, Repeated},
+    Globals,
+};
 use swc_ecma_ast::*;
-use swc_ecma_transforms::optimization::simplify::dead_branch_remover;
-use swc_ecma_transforms::optimization::simplify::expr_simplifier;
-use swc_ecma_transforms::pass::JsPass;
+use swc_ecma_transforms::{
+    optimization::simplify::{dead_branch_remover, expr_simplifier},
+    pass::JsPass,
+};
 use swc_ecma_utils::StmtLike;
-use swc_ecma_visit::as_folder;
-use swc_ecma_visit::noop_visit_mut_type;
-use swc_ecma_visit::VisitMut;
-use swc_ecma_visit::VisitMutWith;
-use swc_ecma_visit::VisitWith;
+use swc_ecma_visit::{as_folder, noop_visit_mut_type, VisitMut, VisitMutWith, VisitWith};
 
 mod drop_console;
 mod hoist_decls;
@@ -46,11 +43,15 @@ mod optimize;
 mod pure;
 mod util;
 
-pub(crate) fn compressor<'a>(
+pub(crate) fn compressor<'a, M>(
     globals: &'a Globals,
     marks: Marks,
     options: &'a CompressOptions,
-) -> impl 'a + JsPass {
+    mode: &'a M,
+) -> impl 'a + JsPass
+where
+    M: Mode,
+{
     let console_remover = Optional {
         enabled: options.drop_console,
         visitor: drop_console(),
@@ -64,12 +65,16 @@ pub(crate) fn compressor<'a>(
         data: None,
         optimizer_state: Default::default(),
         left_parallel_depth: 0,
+        mode,
     };
 
     chain!(console_remover, as_folder(compressor), expr_simplifier())
 }
 
-struct Compressor<'a> {
+struct Compressor<'a, M>
+where
+    M: Mode,
+{
     globals: &'a Globals,
     marks: Marks,
     options: &'a CompressOptions,
@@ -79,15 +84,23 @@ struct Compressor<'a> {
     optimizer_state: OptimizerState,
     /// `0` means we should not create more threads.
     left_parallel_depth: u8,
+
+    mode: &'a M,
 }
 
-impl CompilerPass for Compressor<'_> {
+impl<M> CompilerPass for Compressor<'_, M>
+where
+    M: Mode,
+{
     fn name() -> Cow<'static, str> {
         "compressor".into()
     }
 }
 
-impl Compressor<'_> {
+impl<M> Compressor<'_, M>
+where
+    M: Mode,
+{
     fn handle_stmt_likes<T>(&mut self, stmts: &mut Vec<T>)
     where
         T: StmtLike,
@@ -119,7 +132,7 @@ impl Compressor<'_> {
     /// Optimize a bundle in a parallel.
     fn visit_par<N>(&mut self, nodes: &mut Vec<N>)
     where
-        N: Send + Sync + for<'aa> VisitMutWith<Compressor<'aa>>,
+        N: Send + Sync + for<'aa> VisitMutWith<Compressor<'aa, M>>,
     {
         log::debug!("visit_par(left_depth = {})", self.left_parallel_depth);
 
@@ -134,6 +147,7 @@ impl Compressor<'_> {
                     data: None,
                     optimizer_state: Default::default(),
                     left_parallel_depth: 0,
+                    mode: self.mode,
                 };
                 node.visit_mut_with(&mut v);
 
@@ -153,6 +167,7 @@ impl Compressor<'_> {
                             data: None,
                             optimizer_state: Default::default(),
                             left_parallel_depth: self.left_parallel_depth - 1,
+                            mode: self.mode,
                         };
                         node.visit_mut_with(&mut v);
 
@@ -169,7 +184,7 @@ impl Compressor<'_> {
 
     fn optimize_unit_repeatedly<N>(&mut self, n: &mut N)
     where
-        N: CompileUnit + VisitWith<UsageAnalyzer> + for<'aa> VisitMutWith<Compressor<'aa>>,
+        N: CompileUnit + VisitWith<UsageAnalyzer> + for<'aa> VisitMutWith<Compressor<'aa, M>>,
     {
         if cfg!(feature = "debug") {
             log::debug!(
@@ -185,7 +200,7 @@ impl Compressor<'_> {
                 DeclHoisterConfig {
                     hoist_fns: self.options.hoist_fns,
                     hoist_vars: self.options.hoist_vars,
-                    top_level: self.options.top_level(),
+                    _top_level: self.options.top_level(),
                 },
                 &data,
             );
@@ -215,7 +230,7 @@ impl Compressor<'_> {
     /// Optimize a module. `N` can be [Module] or [FnExpr].
     fn optimize_unit<N>(&mut self, n: &mut N)
     where
-        N: CompileUnit + VisitWith<UsageAnalyzer> + for<'aa> VisitMutWith<Compressor<'aa>>,
+        N: CompileUnit + VisitWith<UsageAnalyzer> + for<'aa> VisitMutWith<Compressor<'aa, M>>,
     {
         self.data = Some(analyze(&*n, Some(self.marks)));
 
@@ -287,7 +302,7 @@ impl Compressor<'_> {
 
             let start_time = now();
 
-            let mut visitor = pure_optimizer(&self.options, self.marks);
+            let mut visitor = pure_optimizer(&self.options, self.marks, self.mode);
             n.apply(&mut visitor);
             self.changed |= visitor.changed();
 
@@ -317,6 +332,7 @@ impl Compressor<'_> {
                 self.options,
                 self.data.as_ref().unwrap(),
                 &mut self.optimizer_state,
+                self.mode,
             );
             n.apply(&mut visitor);
             self.changed |= visitor.changed();
@@ -373,7 +389,10 @@ impl Compressor<'_> {
     }
 }
 
-impl VisitMut for Compressor<'_> {
+impl<M> VisitMut for Compressor<'_, M>
+where
+    M: Mode,
+{
     noop_visit_mut_type!();
 
     fn visit_mut_fn_expr(&mut self, n: &mut FnExpr) {

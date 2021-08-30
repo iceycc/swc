@@ -1,11 +1,9 @@
+use std::fmt::Display;
+
 use crate::typescript::TsTypeAnn;
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use swc_atoms::JsWord;
-use swc_common::ast_node;
-use swc_common::EqIgnoreSpan;
-use swc_common::Span;
-use swc_common::Spanned;
+use swc_common::{ast_node, EqIgnoreSpan, Span, Spanned};
 
 /// Identifer used as a pattern.
 #[derive(Spanned, Clone, Debug, PartialEq, Eq, Hash, EqIgnoreSpan, Serialize, Deserialize)]
@@ -35,6 +33,12 @@ pub struct Ident {
     /// TypeScript only. Used in case of an optional parameter.
     #[serde(default)]
     pub optional: bool,
+}
+
+impl Display for Ident {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{:?}", self.sym, self.span.ctxt)
+    }
 }
 
 #[cfg(feature = "arbitrary")]

@@ -1,7 +1,3 @@
-#![feature(test)]
-
-extern crate test;
-
 use crate::common::Normalizer;
 use pretty_assertions::assert_eq;
 use std::{
@@ -197,6 +193,7 @@ where
 }
 
 #[testing::fixture("tests/typescript-errors/**/*.ts")]
+#[testing::fixture("tests/typescript-errors/**/*.tsx")]
 fn errors(file: PathBuf) {
     let file_name = file.display().to_string();
 

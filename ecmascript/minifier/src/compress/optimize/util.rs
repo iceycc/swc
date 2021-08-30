@@ -1,18 +1,17 @@
-use super::Ctx;
-use super::Optimizer;
-use std::ops::Deref;
-use std::ops::DerefMut;
+use crate::mode::Mode;
+
+use super::{Ctx, Optimizer};
+use std::ops::{Deref, DerefMut};
 use swc_atoms::JsWord;
 use swc_common::Span;
 use swc_ecma_ast::*;
-use swc_ecma_utils::prop_name_eq;
-use swc_ecma_utils::ExprExt;
-use swc_ecma_utils::Id;
-use swc_ecma_visit::noop_visit_mut_type;
-use swc_ecma_visit::VisitMut;
-use swc_ecma_visit::VisitMutWith;
+use swc_ecma_utils::{prop_name_eq, ExprExt, Id};
+use swc_ecma_visit::{noop_visit_mut_type, VisitMut, VisitMutWith};
 
-impl<'b> Optimizer<'b> {
+impl<'b, M> Optimizer<'b, M>
+where
+    M: Mode,
+{
     pub(super) fn access_property<'e>(
         &mut self,
         expr: &'e mut Expr,
@@ -83,7 +82,7 @@ impl<'b> Optimizer<'b> {
 
     /// RAII guard to change context temporarically
     #[inline]
-    pub(super) fn with_ctx(&mut self, ctx: Ctx) -> WithCtx<'_, 'b> {
+    pub(super) fn with_ctx(&mut self, ctx: Ctx) -> WithCtx<'_, 'b, M> {
         let orig_ctx = self.ctx;
         self.ctx = ctx;
         WithCtx {
@@ -93,26 +92,26 @@ impl<'b> Optimizer<'b> {
     }
 }
 
-pub(super) struct WithCtx<'a, 'b> {
-    reducer: &'a mut Optimizer<'b>,
+pub(super) struct WithCtx<'a, 'b, M> {
+    reducer: &'a mut Optimizer<'b, M>,
     orig_ctx: Ctx,
 }
 
-impl<'b> Deref for WithCtx<'_, 'b> {
-    type Target = Optimizer<'b>;
+impl<'b, M> Deref for WithCtx<'_, 'b, M> {
+    type Target = Optimizer<'b, M>;
 
     fn deref(&self) -> &Self::Target {
         &self.reducer
     }
 }
 
-impl DerefMut for WithCtx<'_, '_> {
+impl<M> DerefMut for WithCtx<'_, '_, M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.reducer
     }
 }
 
-impl Drop for WithCtx<'_, '_> {
+impl<M> Drop for WithCtx<'_, '_, M> {
     fn drop(&mut self) {
         self.reducer.ctx = self.orig_ctx;
     }

@@ -1,7 +1,6 @@
 use self::swc_ecma_parser::{EsConfig, Parser, StringInput, Syntax};
 use super::*;
-use crate::config::Config;
-use crate::text_writer::omit_trailing_semi;
+use crate::{config::Config, text_writer::omit_trailing_semi};
 use std::{
     fmt::Debug,
     io::Write,
@@ -93,7 +92,10 @@ pub(crate) fn assert_min(from: &str, to: &str) {
     let out = parse_then_emit(
         from,
         Config { minify: true },
-        Syntax::default(),
+        Syntax::Es(EsConfig {
+            static_blocks: true,
+            ..Default::default()
+        }),
         EsVersion::latest(),
     );
 

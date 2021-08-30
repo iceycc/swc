@@ -10,15 +10,18 @@ use crate::config::{
     SourceMapsConfig,
 };
 use anyhow::{bail, Context, Error};
-use config::JsMinifyOptions;
+use atoms::JsWord;
+use config::{util::BoolOrObject, JsMinifyCommentOption, JsMinifyOptions};
 use dashmap::DashMap;
 use serde::Serialize;
 use serde_json::error::Category;
 pub use sourcemap;
 use std::{
     fs::{read_to_string, File},
+    io::Write,
+    mem::take,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use swc_common::{
     chain,
@@ -26,9 +29,10 @@ use swc_common::{
     errors::Handler,
     input::StringInput,
     source_map::SourceMapGenConfig,
+    sync::Lrc,
     BytePos, FileName, Globals, Mark, SourceFile, SourceMap, Spanned, DUMMY_SP, GLOBALS,
 };
-use swc_ecma_ast::Program;
+use swc_ecma_ast::{Ident, Invalid, Program};
 use swc_ecma_codegen::{self, text_writer::WriteJs, Emitter, Node};
 use swc_ecma_loader::resolvers::{
     lru::CachingResolver, node::NodeModulesResolver, tsc::TsConfigResolver,
@@ -43,7 +47,7 @@ use swc_ecma_transforms::{
     pass::noop,
     resolver_with_mark,
 };
-use swc_ecma_visit::FoldWith;
+use swc_ecma_visit::{noop_visit_type, FoldWith, Visit, VisitWith};
 
 mod builder;
 pub mod config;
@@ -79,9 +83,59 @@ pub mod resolver {
     }
 }
 
+#[derive(Clone, Default)]
+struct LockedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LockedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut lock = self
+            .0
+            .lock()
+            .expect("failed to get lock while trying to report error");
+
+        lock.extend_from_slice(buf);
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Try operation with a [Handler] and prints the errors as a [String] wrapped
+/// by [Err].
+pub fn try_with_handler<F, Ret>(cm: Lrc<SourceMap>, op: F) -> Result<Ret, Error>
+where
+    F: FnOnce(&Handler) -> Result<Ret, Error>,
+{
+    let wr = Box::new(LockedWriter::default());
+
+    let handler = Handler::with_emitter_writer(wr.clone(), Some(cm.clone()));
+
+    let ret = swc_ecma_utils::HANDLER.set(&handler, || op(&handler));
+
+    if handler.has_errors() {
+        let mut lock =
+            wr.0.lock()
+                .expect("reference to handler should not exist in this point");
+        let error = take(&mut *lock);
+
+        let msg = String::from_utf8(error).expect("error string should be utf8");
+
+        ret.context(msg)
+    } else {
+        ret
+    }
+}
+
 type SwcImportResolver =
     Arc<NodeImportResolver<CachingResolver<TsConfigResolver<NodeModulesResolver>>>>;
 
+/// All methods accept [Handler], which is a storage for errors.
+///
+/// The caller should check if the handler contains any errors after calling
+/// method.
 pub struct Compiler {
     /// swc uses rustc's span interning.
     ///
@@ -89,7 +143,6 @@ pub struct Compiler {
     globals: Globals,
     /// CodeMap
     pub cm: Arc<SourceMap>,
-    pub handler: Arc<Handler>,
     comments: SwcComments,
 }
 
@@ -124,6 +177,7 @@ impl Compiler {
         &self,
         fm: &SourceFile,
         input_src_map: &InputSourceMap,
+        is_default: bool,
     ) -> Result<Option<sourcemap::SourceMap>, Error> {
         self.run(|| -> Result<_, Error> {
             let name = &fm.name;
@@ -168,7 +222,17 @@ impl Compiler {
                                         Err(_) => Err(err),
                                     }
                                 })
-                                .context("failed to open input source map file")?;
+                                .context("failed to open input source map file");
+
+                            let file = if !is_default {
+                                file?
+                            } else {
+                                match file {
+                                    Ok(v) => v,
+                                    Err(_) => return Ok(None),
+                                }
+                            };
+
                             Ok(Some(sourcemap::SourceMap::from_reader(file).with_context(
                                 || format!("failed to read input source map from file at {}", path),
                             )?))
@@ -216,6 +280,7 @@ impl Compiler {
     pub fn parse_js(
         &self,
         fm: Arc<SourceFile>,
+        handler: &Handler,
         target: JscTarget,
         syntax: Syntax,
         is_module: bool,
@@ -238,12 +303,12 @@ impl Compiler {
                 let m = parser.parse_module();
 
                 for e in parser.take_errors() {
-                    e.into_diagnostic(&self.handler).emit();
+                    e.into_diagnostic(handler).emit();
                     error = true;
                 }
 
                 m.map_err(|e| {
-                    e.into_diagnostic(&self.handler).emit();
+                    e.into_diagnostic(handler).emit();
                     Error::msg("failed to parse module")
                 })
                 .map(Program::Module)?
@@ -251,12 +316,12 @@ impl Compiler {
                 let s = parser.parse_script();
 
                 for e in parser.take_errors() {
-                    e.into_diagnostic(&self.handler).emit();
+                    e.into_diagnostic(handler).emit();
                     error = true;
                 }
 
                 s.map_err(|e| {
-                    e.into_diagnostic(&self.handler).emit();
+                    e.into_diagnostic(handler).emit();
                     Error::msg("failed to parse module")
                 })
                 .map(Program::Script)?
@@ -285,13 +350,60 @@ impl Compiler {
         output_path: Option<PathBuf>,
         target: JscTarget,
         source_map: SourceMapsConfig,
+        source_map_names: &[JsWord],
         orig: Option<&sourcemap::SourceMap>,
         minify: bool,
+        preserve_comments: Option<BoolOrObject<JsMinifyCommentOption>>,
     ) -> Result<TransformOutput, Error>
     where
-        T: Node,
+        T: Node + VisitWith<IdentCollector>,
     {
         self.run(|| {
+            let preserve_comments = preserve_comments.unwrap_or_else(|| {
+                if minify {
+                    BoolOrObject::Obj(JsMinifyCommentOption::PreserveSomeComments)
+                } else {
+                    BoolOrObject::Obj(JsMinifyCommentOption::PreserveAllComments)
+                }
+            });
+
+            let span = node.span();
+
+            match preserve_comments {
+                BoolOrObject::Bool(true)
+                | BoolOrObject::Obj(JsMinifyCommentOption::PreserveAllComments) => {}
+
+                BoolOrObject::Obj(JsMinifyCommentOption::PreserveSomeComments) => {
+                    let preserve_excl = |pos: &BytePos, vc: &mut Vec<Comment>| -> bool {
+                        if *pos < span.lo || *pos >= span.hi {
+                            return true;
+                        }
+
+                        // Preserve license comments.
+                        if vc.iter().any(|c| c.text.contains("@license")) {
+                            return true;
+                        }
+
+                        vc.retain(|c: &Comment| c.text.starts_with("!"));
+                        !vc.is_empty()
+                    };
+                    self.comments.leading.retain(preserve_excl);
+                    self.comments.trailing.retain(preserve_excl);
+                }
+
+                BoolOrObject::Bool(false) => {
+                    let remove_all_in_range = |pos: &BytePos, _: &mut Vec<Comment>| -> bool {
+                        if *pos < span.lo || *pos >= span.hi {
+                            return true;
+                        }
+
+                        false
+                    };
+                    self.comments.leading.retain(remove_all_in_range);
+                    self.comments.trailing.retain(remove_all_in_range);
+                }
+            }
+
             let mut src_map_buf = vec![];
 
             let src = {
@@ -338,6 +450,7 @@ impl Compiler {
                                 SwcSourceMapConfig {
                                     source_file_name,
                                     output_path: output_path.as_deref(),
+                                    names: source_map_names,
                                 },
                             )
                             .to_writer(&mut buf)
@@ -360,6 +473,7 @@ impl Compiler {
                             SwcSourceMapConfig {
                                 source_file_name,
                                 output_path: output_path.as_deref(),
+                                names: source_map_names,
                             },
                         )
                         .to_writer(&mut buf)
@@ -385,6 +499,8 @@ struct SwcSourceMapConfig<'a> {
     source_file_name: Option<&'a str>,
     /// Output path of the `.map` file.
     output_path: Option<&'a Path>,
+
+    names: &'a [JsWord],
 }
 
 impl SourceMapGenConfig for SwcSourceMapConfig<'_> {
@@ -415,14 +531,17 @@ impl SourceMapGenConfig for SwcSourceMapConfig<'_> {
             None => f.to_string(),
         }
     }
+
+    fn names(&self) -> Vec<&str> {
+        self.names.iter().map(|v| &**v).collect()
+    }
 }
 
 /// High-level apis.
 impl Compiler {
-    pub fn new(cm: Arc<SourceMap>, handler: Arc<Handler>) -> Self {
+    pub fn new(cm: Arc<SourceMap>) -> Self {
         Compiler {
             cm,
-            handler,
             globals: Globals::new(),
             comments: Default::default(),
         }
@@ -509,6 +628,7 @@ impl Compiler {
     /// This method does **not** parse module.
     pub fn config_for_file<'a>(
         &'a self,
+        handler: &Handler,
         opts: &Options,
         name: &FileName,
     ) -> Result<Option<BuiltConfig<impl 'a + swc_ecma_visit::Fold>>, Error> {
@@ -524,7 +644,7 @@ impl Compiler {
                 name,
                 opts.output_path.as_deref(),
                 opts.source_file_name.clone(),
-                &self.handler,
+                &handler,
                 opts.is_module,
                 Some(config),
                 Some(&self.comments),
@@ -534,24 +654,25 @@ impl Compiler {
         .with_context(|| format!("failed to load config for file '{:?}'", name))
     }
 
-    pub fn run_transform<F, Ret>(&self, external_helpers: bool, op: F) -> Ret
+    pub fn run_transform<F, Ret>(&self, handler: &Handler, external_helpers: bool, op: F) -> Ret
     where
         F: FnOnce() -> Ret,
     {
         self.run(|| {
             helpers::HELPERS.set(&Helpers::new(external_helpers), || {
-                swc_ecma_utils::HANDLER.set(&self.handler, || op())
+                swc_ecma_utils::HANDLER.set(handler, || op())
             })
         })
     }
 
     pub fn transform(
         &self,
+        handler: &Handler,
         program: Program,
         external_helpers: bool,
         mut pass: impl swc_ecma_visit::Fold,
     ) -> Program {
-        self.run_transform(external_helpers, || {
+        self.run_transform(handler, external_helpers, || {
             // Fold module
             program.fold_with(&mut pass)
         })
@@ -561,6 +682,7 @@ impl Compiler {
     pub fn process_js_with_custom_pass<P>(
         &self,
         fm: Arc<SourceFile>,
+        handler: &Handler,
         opts: &Options,
         custom_after_pass: P,
     ) -> Result<TransformOutput, Error>
@@ -568,7 +690,7 @@ impl Compiler {
         P: swc_ecma_visit::Fold,
     {
         self.run(|| -> Result<_, Error> {
-            let config = self.run(|| self.config_for_file(opts, &fm.name))?;
+            let config = self.run(|| self.config_for_file(handler, opts, &fm.name))?;
             let config = match config {
                 Some(v) => v,
                 None => {
@@ -586,6 +708,7 @@ impl Compiler {
                 is_module: config.is_module,
                 output_path: config.output_path,
                 source_file_name: config.source_file_name,
+                preserve_comments: config.preserve_comments,
             };
 
             let orig = if opts
@@ -595,20 +718,21 @@ impl Compiler {
                 .map(|v| v.enabled())
                 .unwrap_or_default()
             {
-                self.get_orig_src_map(&fm, &opts.config.input_source_map)?
+                self.get_orig_src_map(&fm, &opts.config.input_source_map, false)?
             } else {
                 None
             };
 
             let program = self.parse_js(
                 fm.clone(),
+                handler,
                 config.target,
                 config.syntax,
                 config.is_module,
                 true,
             )?;
 
-            self.process_js_inner(program, orig.as_ref(), config)
+            self.process_js_inner(handler, program, orig.as_ref(), config)
         })
         .context("failed to process js file")
     }
@@ -616,21 +740,23 @@ impl Compiler {
     pub fn process_js_file(
         &self,
         fm: Arc<SourceFile>,
+        handler: &Handler,
         opts: &Options,
     ) -> Result<TransformOutput, Error> {
-        self.process_js_with_custom_pass(fm, opts, noop())
+        self.process_js_with_custom_pass(fm, handler, opts, noop())
     }
 
     pub fn minify(
         &self,
         fm: Arc<SourceFile>,
+        handler: &Handler,
         opts: &JsMinifyOptions,
     ) -> Result<TransformOutput, Error> {
         self.run(|| {
             let target = opts.ecma.clone().into();
 
             let orig = if opts.source_map {
-                self.get_orig_src_map(&fm, &InputSourceMap::Bool(opts.source_map))?
+                self.get_orig_src_map(&fm, &InputSourceMap::Bool(true), true)?
             } else {
                 None
             };
@@ -648,6 +774,7 @@ impl Compiler {
             let module = self
                 .parse_js(
                     fm.clone(),
+                    handler,
                     target,
                     Syntax::Es(EsConfig {
                         jsx: true,
@@ -665,9 +792,19 @@ impl Compiler {
                 .context("failed to parse input file")?
                 .expect_module();
 
+            let source_map_names = {
+                let mut v = IdentCollector {
+                    names: Default::default(),
+                };
+
+                module.visit_with(&Invalid { span: DUMMY_SP }, &mut v);
+
+                v.names
+            };
+
             let top_level_mark = Mark::fresh(Mark::root());
 
-            let module = self.run_transform(false, || {
+            let module = self.run_transform(handler, false, || {
                 let module = module.fold_with(&mut resolver_with_mark(top_level_mark));
 
                 let module = swc_ecma_minifier::optimize(
@@ -686,12 +823,14 @@ impl Compiler {
 
             self.print(
                 &module,
-                None,
+                Some(&fm.name.to_string()),
                 opts.output_path.clone().map(From::from),
                 target,
                 SourceMapsConfig::Bool(opts.source_map),
+                &source_map_names,
                 orig.as_ref(),
                 true,
+                Some(opts.format.comments.clone()),
             )
         })
     }
@@ -699,7 +838,12 @@ impl Compiler {
     /// You can use custom pass with this method.
     ///
     /// There exists a [PassBuilder] to help building custom passes.
-    pub fn process_js(&self, program: Program, opts: &Options) -> Result<TransformOutput, Error> {
+    pub fn process_js(
+        &self,
+        handler: &Handler,
+        program: Program,
+        opts: &Options,
+    ) -> Result<TransformOutput, Error> {
         self.run(|| -> Result<_, Error> {
             let loc = self.cm.lookup_char_pos(program.span().lo());
             let fm = loc.file;
@@ -711,12 +855,12 @@ impl Compiler {
                 .map(|v| v.enabled())
                 .unwrap_or_default()
             {
-                self.get_orig_src_map(&fm, &opts.config.input_source_map)?
+                self.get_orig_src_map(&fm, &opts.config.input_source_map, false)?
             } else {
                 None
             };
 
-            let config = self.run(|| self.config_for_file(opts, &fm.name))?;
+            let config = self.run(|| self.config_for_file(handler, opts, &fm.name))?;
 
             let config = match config {
                 Some(v) => v,
@@ -725,29 +869,32 @@ impl Compiler {
                 }
             };
 
-            self.process_js_inner(program, orig.as_ref(), config)
+            self.process_js_inner(handler, program, orig.as_ref(), config)
         })
         .context("failed to process js module")
     }
 
     fn process_js_inner(
         &self,
+        handler: &Handler,
         program: Program,
         orig: Option<&sourcemap::SourceMap>,
         config: BuiltConfig<impl swc_ecma_visit::Fold>,
     ) -> Result<TransformOutput, Error> {
         self.run(|| {
-            if config.minify {
-                let preserve_excl = |_: &BytePos, vc: &mut Vec<Comment>| -> bool {
-                    vc.retain(|c: &Comment| c.text.starts_with("!"));
-                    !vc.is_empty()
+            let source_map_names = {
+                let mut v = IdentCollector {
+                    names: Default::default(),
                 };
-                self.comments.leading.retain(preserve_excl);
-                self.comments.trailing.retain(preserve_excl);
-            }
+
+                program.visit_with(&Invalid { span: DUMMY_SP }, &mut v);
+
+                v.names
+            };
+
             let mut pass = config.pass;
             let program = helpers::HELPERS.set(&Helpers::new(config.external_helpers), || {
-                swc_ecma_utils::HANDLER.set(&self.handler, || {
+                swc_ecma_utils::HANDLER.set(handler, || {
                     // Fold module
                     program.fold_with(&mut pass)
                 })
@@ -759,8 +906,10 @@ impl Compiler {
                 config.output_path,
                 config.target,
                 config.source_maps,
+                &source_map_names,
                 orig,
                 config.minify,
+                config.preserve_comments,
             )
         })
     }
@@ -880,5 +1029,21 @@ impl Comments for SwcComments {
         if !leading.iter().any(|c| c.text == pure_comment.text) {
             leading.push(pure_comment);
         }
+    }
+}
+
+pub struct IdentCollector {
+    names: Vec<JsWord>,
+}
+
+impl Visit for IdentCollector {
+    noop_visit_type!();
+
+    fn visit_ident(&mut self, ident: &Ident, _: &dyn swc_ecma_visit::Node) {
+        if self.names.contains(&ident.sym) {
+            return;
+        }
+
+        self.names.push(ident.sym.clone());
     }
 }

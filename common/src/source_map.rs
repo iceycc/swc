@@ -18,6 +18,7 @@
 //! information, source code snippets, etc.
 pub use crate::syntax_pos::*;
 use crate::{
+    collections::AHashMap,
     errors::SourceMapper,
     rustc_data_structures::stable_hasher::StableHasher,
     sync::{Lock, LockGuard, Lrc, MappedLockGuard},
@@ -28,7 +29,6 @@ use sourcemap::SourceMapBuilder;
 use std::{
     cmp,
     cmp::{max, min},
-    collections::HashMap,
     env, fs,
     hash::Hash,
     io::{self, Read},
@@ -100,7 +100,7 @@ impl StableSourceFileId {
 #[derive(Default)]
 pub(super) struct SourceMapFiles {
     pub(super) source_files: Vec<Lrc<SourceFile>>,
-    stable_id_to_source_file: HashMap<StableSourceFileId, Lrc<SourceFile>>,
+    stable_id_to_source_file: AHashMap<StableSourceFileId, Lrc<SourceFile>>,
 }
 
 /// The interner for spans.
@@ -1073,6 +1073,10 @@ impl SourceMap {
 
         let mut src_id = 0u32;
 
+        for name in config.names() {
+            builder.add_name(name);
+        }
+
         if let Some(orig) = orig {
             for src in orig.sources() {
                 let idx = builder.add_source(src);
@@ -1106,7 +1110,13 @@ impl SourceMap {
                 _ => {
                     f = self.lookup_source_file(pos);
                     src_id = builder.add_source(&config.file_name_to_source(&f.name));
-                    builder.set_source_contents(src_id, Some(&f.src));
+
+                    match f.name {
+                        FileName::Real(..) | FileName::Custom(..) => {}
+                        _ => {
+                            builder.set_source_contents(src_id, Some(&f.src));
+                        }
+                    }
                     cur_file = Some(f.clone());
                     ch_start = 0;
                     line_ch_start = 0;
@@ -1213,6 +1223,11 @@ pub trait SourceMapGenConfig {
     ///
     /// This should **not** return content of the file.
     fn file_name_to_source(&self, f: &FileName) -> String;
+
+    /// # Returns all identifiers for current module.
+    fn names(&self) -> Vec<&str> {
+        vec![]
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -12,37 +12,37 @@
 //! them something other. Don't call methods like `visit_mut_script` nor
 //! `visit_mut_module_items`.
 
-use crate::compress::compressor;
-use crate::marks::Marks;
-use crate::metadata::info_marker;
-use crate::option::ExtraOptions;
-use crate::option::MinifyOptions;
-use crate::pass::compute_char_freq::compute_char_freq;
-use crate::pass::expand_names::name_expander;
-use crate::pass::global_defs;
-use crate::pass::hygiene::hygiene_optimizer;
-pub use crate::pass::hygiene::optimize_hygiene;
-use crate::pass::mangle_names::name_mangler;
-use crate::pass::mangle_props::mangle_properties;
-use crate::pass::precompress::precompress_optimizer;
-use crate::util::now;
-use analyzer::analyze;
+pub use crate::pass::{
+    hygiene::{hygiene_optimizer, optimize_hygiene},
+    unique_scope::unique_scope,
+};
+use crate::{
+    compress::compressor,
+    marks::Marks,
+    metadata::info_marker,
+    option::{ExtraOptions, MinifyOptions},
+    pass::{
+        compute_char_freq::compute_char_freq, expand_names::name_expander, global_defs,
+        mangle_names::name_mangler, mangle_props::mangle_properties,
+        precompress::precompress_optimizer,
+    },
+    util::now,
+};
+use mode::Minification;
 use pass::postcompress::postcompress_optimizer;
 use std::time::Instant;
-use swc_common::comments::Comments;
-use swc_common::sync::Lrc;
-use swc_common::SourceMap;
-use swc_common::GLOBALS;
+use swc_common::{comments::Comments, sync::Lrc, SourceMap, GLOBALS};
 use swc_ecma_ast::Module;
-use swc_ecma_visit::FoldWith;
-use swc_ecma_visit::VisitMutWith;
+use swc_ecma_visit::{FoldWith, VisitMutWith};
 use timing::Timings;
 
 mod analyzer;
 mod compress;
 mod debug;
+pub mod eval;
 pub mod marks;
 mod metadata;
+mod mode;
 pub mod option;
 mod pass;
 pub mod timing;
@@ -88,6 +88,7 @@ pub fn optimize(
     }
 
     m.visit_mut_with(&mut info_marker(comments, marks, extra.top_level_mark));
+    m.visit_mut_with(&mut unique_scope());
 
     if options.wrap {
         // TODO: wrap_common_js
@@ -107,7 +108,7 @@ pub fn optimize(
 
     // Noop.
     // https://github.com/mishoo/UglifyJS2/issues/2794
-    if options.rename && false {
+    if options.rename && DISABLE_BUGGY_PASSES {
         // toplevel.figure_out_scope(options.mangle);
         // TODO: Pass `options.mangle` to name expander.
         m.visit_mut_with(&mut name_expander());
@@ -118,7 +119,8 @@ pub fn optimize(
     }
     if let Some(options) = &options.compress {
         let start = now();
-        m = GLOBALS.with(|globals| m.fold_with(&mut compressor(globals, marks, &options)));
+        m = GLOBALS
+            .with(|globals| m.fold_with(&mut compressor(globals, marks, &options, &Minification)));
         if let Some(start) = start {
             log::info!("compressor took {:?}", Instant::now() - start);
         }
@@ -158,8 +160,8 @@ pub fn optimize(
     }
 
     {
-        let data = analyze(&m, None);
-        m.visit_mut_with(&mut hygiene_optimizer(data, extra.top_level_mark));
+        m.visit_mut_with(&mut unique_scope());
+        m.visit_mut_with(&mut hygiene_optimizer(extra.top_level_mark));
     }
 
     if let Some(ref mut t) = timings {

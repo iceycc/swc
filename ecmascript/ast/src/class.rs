@@ -8,12 +8,11 @@ use crate::{
         Accessibility, TsExprWithTypeArgs, TsIndexSignature, TsTypeAnn, TsTypeParamDecl,
         TsTypeParamInstantiation,
     },
-    EmptyStmt,
+    EmptyStmt, Stmt,
 };
 use is_macro::Is;
 use serde::{Deserialize, Serialize};
-use swc_common::EqIgnoreSpan;
-use swc_common::{ast_node, Span};
+use swc_common::{ast_node, EqIgnoreSpan, Span};
 
 #[ast_node]
 #[derive(Eq, Hash, EqIgnoreSpan)]
@@ -64,6 +63,10 @@ pub enum ClassMember {
     TsIndexSignature(TsIndexSignature),
     #[tag("EmptyStatement")]
     Empty(EmptyStmt),
+
+    // Stage 3
+    #[tag("StaticBlock")]
+    StaticBlock(StaticBlock),
 }
 
 #[ast_node("ClassProperty")]
@@ -236,4 +239,12 @@ pub enum MethodKind {
     Getter,
     #[serde(rename = "setter")]
     Setter,
+}
+
+#[ast_node("StaticBlock")]
+#[derive(Eq, Hash, EqIgnoreSpan)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct StaticBlock {
+    pub span: Span,
+    pub body: Vec<Stmt>,
 }

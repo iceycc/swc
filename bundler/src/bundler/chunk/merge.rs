@@ -1,27 +1,28 @@
-use crate::bundler::keywords::KeywordRenamer;
-use crate::dep_graph::ModuleGraph;
-use crate::inline::inline;
-use crate::modules::Modules;
 use crate::{
-    bundler::load::{Imports, TransformedModule},
+    bundler::{
+        keywords::KeywordRenamer,
+        load::{Imports, TransformedModule},
+    },
+    dep_graph::ModuleGraph,
     id::{Id, ModuleId},
+    inline::inline,
     load::Load,
+    modules::Modules,
     resolve::Resolve,
     util::{CloneMap, ExprExt, VarDeclaratorExt},
     Bundler, Hook, ModuleRecord,
 };
 use anyhow::Error;
-use fxhash::FxBuildHasher;
-use fxhash::FxHashMap;
-use fxhash::FxHashSet;
+use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use indexmap::IndexSet;
 use petgraph::EdgeDirection;
 #[cfg(feature = "concurrent")]
 use rayon::iter::ParallelIterator;
+use std::sync::atomic::Ordering;
 use swc_atoms::js_word;
 use swc_common::{sync::Lock, FileName, SyntaxContext, DUMMY_SP};
 use swc_ecma_ast::*;
-use swc_ecma_utils::{find_ids, prepend, private_ident};
+use swc_ecma_utils::{find_ids, prepend, private_ident, quote_ident, ExprFactory};
 use swc_ecma_visit::{noop_fold_type, noop_visit_mut_type, Fold, VisitMut, VisitMutWith};
 use EdgeDirection::Outgoing;
 
@@ -44,6 +45,10 @@ impl Ctx {
         }
 
         if let Some(v) = self.transitive_remap.get(&ctxt_to_check) {
+            if v == ctxt_to_check {
+                return false;
+            }
+
             return self.is_exported_ctxt(v, entry_export_ctxt);
         }
 
@@ -192,6 +197,9 @@ where
                     Some(v) => v,
                     _ => return,
                 };
+                if remapped == id.ctxt() {
+                    return;
+                }
                 let reexported = id.clone().with_ctxt(remapped);
 
                 add_var(
@@ -397,10 +405,14 @@ where
     }
 
     fn finalize_merging_of_entry(&self, ctx: &Ctx, id: ModuleId, entry: &mut Modules) {
-        log::debug!("All modules are merged");
+        log::trace!("All modules are merged");
+
+        log::debug!("Injecting reexports");
         self.inject_reexports(ctx, id, entry);
 
         // entry.print(&self.cm, "before inline");
+
+        log::debug!("Inlining injected variables");
 
         inline(self.injected_ctxt, entry);
 
@@ -448,6 +460,8 @@ where
             true
         });
 
+        log::debug!("Renaming keywords");
+
         entry.visit_mut_with(&mut KeywordRenamer::default());
 
         // print_hygiene(
@@ -462,6 +476,11 @@ where
 
     /// Remove exports with wrong syntax context
     fn remove_wrong_exports(&self, ctx: &Ctx, info: &TransformedModule, module: &mut Modules) {
+        log::debug!("Removing wrong exports");
+
+        let item_count = module.iter().count();
+        log::trace!("Item count = {}", item_count);
+
         module.retain_mut(|_, item| {
             match item {
                 // TODO: Handle export default
@@ -493,6 +512,8 @@ where
 
             true
         });
+
+        log::debug!("Removed wrong exports");
     }
 
     /// This method handles imports and exports.
@@ -886,6 +907,89 @@ where
                         ref src,
                         ..
                     })) => {
+                        if let Some(export_src) = src {
+                            if let Some((src, _)) = info
+                                .exports
+                                .reexports
+                                .iter()
+                                .find(|s| s.0.src.value == export_src.value)
+                            {
+                                let dep = self.scope.get_module(src.module_id).unwrap();
+                                if !dep.is_es6 {
+                                    dep.helpers.require.store(true, Ordering::SeqCst);
+
+                                    let mut vars = vec![];
+                                    let mod_var = private_ident!("_cjs_module_");
+
+                                    vars.push(VarDeclarator {
+                                        span: DUMMY_SP,
+                                        name: Pat::Ident(mod_var.clone().into()),
+                                        init: Some(Box::new(Expr::Call(CallExpr {
+                                            span: DUMMY_SP,
+                                            callee: Ident::new(
+                                                "load".into(),
+                                                DUMMY_SP.with_ctxt(dep.export_ctxt()),
+                                            )
+                                            .as_callee(),
+                                            args: Default::default(),
+                                            type_args: Default::default(),
+                                        }))),
+                                        definite: Default::default(),
+                                    });
+                                    for s in specifiers {
+                                        match s {
+                                            ExportSpecifier::Namespace(s) => {
+                                                vars.push(VarDeclarator {
+                                                    span: s.span,
+                                                    name: Pat::Ident(s.name.clone().into()),
+                                                    init: Some(Box::new(Expr::Ident(
+                                                        mod_var.clone(),
+                                                    ))),
+                                                    definite: Default::default(),
+                                                });
+                                            }
+                                            ExportSpecifier::Default(s) => {
+                                                vars.push(VarDeclarator {
+                                                    span: DUMMY_SP,
+                                                    name: Pat::Ident(s.exported.clone().into()),
+                                                    init: Some(Box::new(
+                                                        mod_var
+                                                            .clone()
+                                                            .make_member(quote_ident!("default")),
+                                                    )),
+                                                    definite: Default::default(),
+                                                });
+                                            }
+                                            ExportSpecifier::Named(s) => {
+                                                vars.push(VarDeclarator {
+                                                    span: s.span,
+                                                    name: Pat::Ident(
+                                                        s.exported.clone().unwrap().into(),
+                                                    ),
+                                                    init: Some(Box::new(
+                                                        mod_var.clone().make_member(s.orig.clone()),
+                                                    )),
+                                                    definite: Default::default(),
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    if !vars.is_empty() {
+                                        new.push(ModuleItem::Stmt(Stmt::Decl(Decl::Var(
+                                            VarDecl {
+                                                span: DUMMY_SP,
+                                                kind: VarDeclKind::Const,
+                                                declare: Default::default(),
+                                                decls: vars,
+                                            },
+                                        ))));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         for s in specifiers {
                             match s {
                                 ExportSpecifier::Named(ExportNamedSpecifier {

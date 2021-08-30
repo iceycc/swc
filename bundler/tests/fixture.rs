@@ -1,14 +1,9 @@
-#![feature(test)]
-
-extern crate test;
-
 use self::common::*;
 use anyhow::Error;
 use std::{
     self,
     collections::HashMap,
-    env,
-    fs::{create_dir_all, read_dir},
+    fs::read_dir,
     io,
     path::{Path, PathBuf},
 };
@@ -19,123 +14,15 @@ use swc_ecma_ast::{
     Bool, Expr, ExprOrSuper, Ident, KeyValueProp, Lit, MemberExpr, MetaPropExpr, PropName, Str,
 };
 use swc_ecma_codegen::{text_writer::JsWriter, Emitter};
+use swc_ecma_loader::NODE_BUILTINS;
 use swc_ecma_transforms::fixer;
 use swc_ecma_visit::FoldWith;
-use test::{
-    test_main, DynTestFn, Options, ShouldPanic::No, TestDesc, TestDescAndFn, TestName, TestType,
-};
 use testing::NormalizedOutput;
-use walkdir::DirEntry;
-use walkdir::WalkDir;
 
 #[path = "common/mod.rs"]
 mod common;
 
-fn add_test<F: FnOnce() + Send + 'static>(
-    tests: &mut Vec<TestDescAndFn>,
-    name: String,
-    ignore: bool,
-    f: F,
-) {
-    tests.push(TestDescAndFn {
-        desc: TestDesc {
-            test_type: TestType::UnitTest,
-            name: TestName::DynTestName(name.replace("-", "_").replace("/", "::")),
-            ignore,
-            should_panic: No,
-            allow_fail: false,
-        },
-        testfn: DynTestFn(Box::new(f)),
-    });
-}
-
-fn reference_tests(tests: &mut Vec<TestDescAndFn>, errors: bool) -> Result<(), io::Error> {
-    let root = {
-        let mut root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-        root.push("tests");
-        root.push(if errors { "error" } else { "fixture" });
-        root
-    };
-
-    eprintln!("Loading tests from {}", root.display());
-
-    let dir = root;
-
-    for entry in WalkDir::new(&dir).into_iter() {
-        let entry = entry?;
-        if !entry.path().join("input").exists() {
-            continue;
-        }
-
-        let ignore = entry
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(".");
-
-        let dir_name = entry
-            .path()
-            .strip_prefix(&dir)
-            .expect("failed to strip prefix")
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        let _ = create_dir_all(entry.path().join("output"));
-
-        let entries = read_dir(entry.path().join("input"))?
-            .filter(|e| match e {
-                Ok(e) => {
-                    if e.path()
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with("entry")
-                    {
-                        true
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            })
-            .map(|e| -> Result<_, io::Error> {
-                let e = e?;
-                Ok((
-                    e.file_name().to_string_lossy().to_string(),
-                    FileName::Real(e.path()),
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
-
-        let name = format!(
-            "fixture::{}::{}",
-            if errors { "error" } else { "pass" },
-            dir_name
-        );
-
-        let ignore = ignore
-            || !name.contains(
-                &env::var("TEST")
-                    .ok()
-                    .unwrap_or("".into())
-                    .replace("::", "/")
-                    .replace("_", "-"),
-            );
-
-        add_test(tests, name, ignore, move || {
-            eprintln!("\n\n========== Running reference test {}\n", dir_name);
-
-            do_test(&entry, entries.clone(), true);
-            do_test(&entry, entries, false);
-        });
-    }
-
-    Ok(())
-}
-
-fn do_test(entry: &DirEntry, entries: HashMap<String, FileName>, inline: bool) {
+fn do_test(entry: &Path, entries: HashMap<String, FileName>, inline: bool) {
     testing::run_test2(false, |cm, _| {
         let globals = Globals::default();
         let bundler = Bundler::new(
@@ -146,44 +33,7 @@ fn do_test(entry: &DirEntry, entries: HashMap<String, FileName>, inline: bool) {
             Config {
                 require: true,
                 disable_inliner: !inline,
-                external_modules: vec![
-                    "assert",
-                    "buffer",
-                    "child_process",
-                    "console",
-                    "cluster",
-                    "crypto",
-                    "dgram",
-                    "dns",
-                    "events",
-                    "fs",
-                    "http",
-                    "http2",
-                    "https",
-                    "net",
-                    "os",
-                    "path",
-                    "perf_hooks",
-                    "process",
-                    "querystring",
-                    "readline",
-                    "repl",
-                    "stream",
-                    "string_decoder",
-                    "timers",
-                    "tls",
-                    "tty",
-                    "url",
-                    "util",
-                    "v8",
-                    "vm",
-                    "wasi",
-                    "worker",
-                    "zlib",
-                ]
-                .into_iter()
-                .map(From::from)
-                .collect(),
+                external_modules: NODE_BUILTINS.to_vec().into_iter().map(From::from).collect(),
                 module: Default::default(),
             },
             Box::new(Hook),
@@ -223,7 +73,7 @@ fn do_test(entry: &DirEntry, entries: HashMap<String, FileName>, inline: bool) {
                 BundleKind::Dynamic => format!("dynamic.{}.js", bundled.id).into(),
             };
 
-            let output_dir = entry.path().join("output");
+            let output_dir = entry.join("output");
 
             let output_path = if inline {
                 output_dir
@@ -259,12 +109,37 @@ fn do_test(entry: &DirEntry, entries: HashMap<String, FileName>, inline: bool) {
     .expect("failed to process a module");
 }
 
-#[test]
-fn pass() {
-    let args: Vec<_> = env::args().collect();
-    let mut tests = Vec::new();
-    reference_tests(&mut tests, false).unwrap();
-    test_main(&args, tests, Some(Options::new()));
+#[testing::fixture("tests/fixture/**/input")]
+fn pass(entry: PathBuf) {
+    let entries = read_dir(&entry)
+        .unwrap()
+        .filter(|e| match e {
+            Ok(e) => {
+                if e.path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("entry")
+                {
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        })
+        .map(|e| -> Result<_, io::Error> {
+            let e = e?;
+            Ok((
+                e.file_name().to_string_lossy().to_string(),
+                FileName::Real(e.path()),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()
+        .unwrap();
+
+    do_test(entry.parent().unwrap(), entries.clone(), true);
+    do_test(entry.parent().unwrap(), entries, false);
 }
 
 struct Hook;

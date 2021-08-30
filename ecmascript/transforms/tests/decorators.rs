@@ -5,19 +5,17 @@
     feature = "swc_ecma_transforms_proposal",
 ))]
 
-use swc_common::chain;
-use swc_common::Mark;
+use swc_common::{chain, Mark};
 use swc_ecma_parser::{EsConfig, Syntax, TsConfig};
 use swc_ecma_transforms_base::resolver::resolver;
-use swc_ecma_transforms_compat::es2015::classes;
-use swc_ecma_transforms_compat::es2015::function_name;
-use swc_ecma_transforms_compat::es2020::class_properties;
+use swc_ecma_transforms_compat::{
+    es2015::{classes, function_name},
+    es2020::class_properties,
+};
 use swc_ecma_transforms_module::common_js;
 use swc_ecma_transforms_optimization::simplify::inlining;
-use swc_ecma_transforms_proposal::decorators;
-use swc_ecma_transforms_proposal::decorators::Config;
-use swc_ecma_transforms_testing::test;
-use swc_ecma_transforms_testing::test_exec;
+use swc_ecma_transforms_proposal::{decorators, decorators::Config};
+use swc_ecma_transforms_testing::{test, test_exec};
 use swc_ecma_transforms_typescript::strip;
 use swc_ecma_visit::Fold;
 
@@ -4751,7 +4749,7 @@ test!(
       }
 
       @Get('/callback')
-      callback(@Res() res: express.Response, @Session() session: express.Express.Session) {
+      async callback(@Res() res: express.Response, @Session() session: express.Express.Session) {
         const token = await this.getToken(code)
         const user = await this.getUserInfo(token.access_token)
 
@@ -4776,7 +4774,7 @@ export let AppController = _class = _dec14(_class = _dec13(_class = _dec12(((_cl
     getHello(): string {
         return this.appService.getHello();
     }
-    callback(res: express.Response, session: express.Express.Session) {
+    async callback(res: express.Response, session: express.Express.Session) {
         const token = await this.getToken(code);
         const user = await this.getUserInfo(token.access_token);
         session.oauth2Token = token;

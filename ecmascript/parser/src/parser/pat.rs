@@ -1,7 +1,9 @@
 //! 13.3.3 Destructuring Binding Patterns
 use super::{util::ExprExt, *};
-use crate::parser::class_and_fn::is_not_this;
-use crate::{parser::expr::PatOrExprOrSpread, token::AssignOpToken};
+use crate::{
+    parser::{class_and_fn::is_not_this, expr::PatOrExprOrSpread},
+    token::AssignOpToken,
+};
 use std::iter;
 use swc_atoms::js_word;
 use swc_common::Spanned;
@@ -141,7 +143,7 @@ impl<'a, I: Tokens> Parser<I> {
             }
             && (peeked_is!(self, IdentName) || peeked_is!(self, '{') || peeked_is!(self, '['));
         if has_modifier {
-            let _ = self.parse_ts_modifier(&["public", "protected", "private", "readonly"]);
+            let _ = self.parse_ts_modifier(&["public", "protected", "private", "readonly"], false);
         }
 
         return Ok(has_modifier);
@@ -319,8 +321,8 @@ impl<'a, I: Tokens> Parser<I> {
             let accessibility = self.parse_access_modifier()?;
             (
                 accessibility,
-                self.parse_ts_modifier(&["override"])?.is_some(),
-                self.parse_ts_modifier(&["readonly"])?.is_some(),
+                self.parse_ts_modifier(&["override"], false)?.is_some(),
+                self.parse_ts_modifier(&["readonly"], false)?.is_some(),
             )
         } else {
             (None, false, false)
